@@ -1,30 +1,100 @@
 const express = require('express');
 const router = express.Router();
 const pool = require('../database/db');
-const { requireAuth, requirePermission } = require('../middleware/auth');
+const bcrypt = require('bcrypt');
+const { v4: uuidv4 } = require('uuid');
+const { requireAuth } = require('../middleware/auth');
 
-// liste users
-router.get('/', requireAuth, requirePermission('users', 'read'), async (req, res) => {
-    const limit = parseInt(req.query.limit) || 10;
-    const offset = parseInt(req.query.page || 1) * limit - limit;
+// inscription
+router.post('/register', async (req, res) => {
+    const { email, password, nom, prenom } = req.body;
 
-    const result = await pool.query(
-        `SELECT u.id, u.email, u.nom, u.prenom, u.actif,
-                array_agg(r.nom) FILTER (WHERE r.nom IS NOT NULL) AS roles
-         FROM utilisateurs u
-         LEFT JOIN utilisateur_roles ur ON u.id = ur.utilisateur_id
-         LEFT JOIN roles r ON ur.role_id = r.id
-         GROUP BY u.id
-         ORDER BY u.id
-         LIMIT $1 OFFSET $2`,
-        [limit, offset]
+    if (!email || !password) {
+        return res.status(400).json({ error: 'email et password requis' });
+    }
+
+    const client = await pool.connect();
+    await client.query('BEGIN');
+
+    const checkUser = await client.query(
+        'SELECT id FROM utilisateurs WHERE email = $1',
+        [email]
     );
 
-    res.json(result.rows);
+    if (checkUser.rows.length > 0) {
+        await client.query('ROLLBACK');
+        client.release();
+        return res.status(409).json({ error: 'email deja utilisé' });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    const result = await client.query(
+        `INSERT INTO utilisateurs (email, password_hash, nom, prenom) 
+         VALUES ($1, $2, $3, $4) 
+         RETURNING id, email, nom, prenom`,
+        [email, passwordHash, nom, prenom]
+    );
+
+    await client.query(
+        `INSERT INTO utilisateur_roles (utilisateur_id, role_id) 
+         SELECT $1, id FROM roles WHERE nom = 'user'`,
+        [result.rows[0].id]
+    );
+
+    await client.query('COMMIT');
+    client.release();
+
+    res.status(201).json(result.rows[0]);
 });
 
-// details utilisateur
-router.get('/:id', requireAuth, requirePermission('users', 'read'), async (req, res) => {
+// connexion
+router.post('/login', async (req, res) => {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+        return res.status(400).json({ error: 'email et password requis' });
+    }
+
+    const result = await pool.query(
+        `SELECT id, email, password_hash, nom, prenom, actif 
+         FROM utilisateurs WHERE email = $1`,
+        [email]
+    );
+
+    if (result.rows.length === 0) {
+        return res.status(401).json({ error: 'identifiants incorrects' });
+    }
+
+    const user = result.rows[0];
+
+    if (!user.actif || !await bcrypt.compare(password, user.password_hash)) {
+        return res.status(401).json({ error: 'identifiants incorrects' });
+    }
+
+    const token = uuidv4();
+    const expiresAt = new Date();
+    expiresAt.setHours(expiresAt.getHours() + 24);
+
+    await pool.query(
+        `INSERT INTO sessions (utilisateur_id, token, date_expiration) 
+         VALUES ($1, $2, $3)`,
+        [user.id, token, expiresAt]
+    );
+
+    res.json({
+        token: token,
+        user: {
+            id: user.id,
+            email: user.email,
+            nom: user.nom,
+            prenom: user.prenom
+        }
+    });
+});
+
+// profil
+router.get('/profile', requireAuth, async (req, res) => {
     const result = await pool.query(
         `SELECT u.id, u.email, u.nom, u.prenom, u.actif,
                 array_agg(r.nom) FILTER (WHERE r.nom IS NOT NULL) AS roles
@@ -33,66 +103,20 @@ router.get('/:id', requireAuth, requirePermission('users', 'read'), async (req, 
          LEFT JOIN roles r ON ur.role_id = r.id
          WHERE u.id = $1
          GROUP BY u.id`,
-        [req.params.id]
+        [req.user.utilisateur_id]
     );
-
-    if (result.rows.length === 0) {
-        return res.status(404).json({ error: 'utilisateur non trouvé' });
-    }
 
     res.json(result.rows[0]);
 });
 
-// modifier utilisateur
-router.put('/:id', requireAuth, requirePermission('users', 'write'), async (req, res) => {
-    const { nom, prenom, actif } = req.body;
-
-    const result = await pool.query(
-        `UPDATE utilisateurs 
-         SET nom = $1, prenom = $2, actif = $3, date_modification = CURRENT_TIMESTAMP 
-         WHERE id = $4 
-         RETURNING id, email, nom, prenom, actif`,
-        [nom, prenom, actif, req.params.id]
+// deconnexion
+router.post('/logout', requireAuth, async (req, res) => {
+    await pool.query(
+        'UPDATE sessions SET actif = false WHERE token = $1',
+        [req.headers['authorization']]
     );
 
-    if (result.rows.length === 0) {
-        return res.status(404).json({ error: 'utilisateur introuvable' });
-    }
-
-    res.json(result.rows[0]);
-});
-
-// supprimer utilisateur
-router.delete('/:id', requireAuth, requirePermission('users', 'delete'), async (req, res) => {
-    if (parseInt(req.params.id) === req.user.utilisateur_id) {
-        return res.status(400).json({ error: 'auto-suppression interdite' });
-    }
-
-    const result = await pool.query(
-        'DELETE FROM utilisateurs WHERE id = $1 RETURNING id, email',
-        [req.params.id]
-    );
-
-    if (result.rows.length === 0) {
-        return res.status(404).json({ error: 'utilisateur non trouvé' });
-    }
-
-    res.json(result.rows[0]);
-});
-
-// permissions d'un utilisateur
-router.get('/:id/permissions', requireAuth, async (req, res) => {
-    const result = await pool.query(
-        `SELECT DISTINCT p.nom, p.ressource, p.action
-         FROM utilisateurs u
-         INNER JOIN utilisateur_roles ur ON u.id = ur.utilisateur_id
-         INNER JOIN role_permissions rp ON ur.role_id = rp.role_id
-         INNER JOIN permissions p ON rp.permission_id = p.id
-         WHERE u.id = $1`,
-        [req.params.id]
-    );
-
-    res.json(result.rows);
+    res.json({ message: 'deconnexion ok' });
 });
 
 module.exports = router;
