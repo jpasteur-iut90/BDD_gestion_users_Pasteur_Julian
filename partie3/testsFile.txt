@@ -1,0 +1,13 @@
+curl -X POST http://localhost:3000/api/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"email":"test@example.com","password":"pass123","nom":"Test","prenom":"User"}'
+
+curl -X POST http://localhost:3000/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"test@example.com","password":"pass123"}'
+
+curl http://localhost:3000/api/auth/profile \
+  -H "Authorization: TOKEN"
+
+curl http://localhost:3000/api/users?page=1&limit=10 \
+  -H "Authorization: TOKEN"
