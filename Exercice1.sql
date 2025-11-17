@@ -63,11 +63,10 @@ CREATE TABLE logs_connexion (
     utilisateur_id INT REFERENCES utilisateurs(id) ON DELETE SET NULL,
     email_tentative VARCHAR(255) NOT NULL,
     date_heure TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    adresse_ip VARCHAR(45),
-    user_agent TEXT,
     succes BOOLEAN NOT NULL,
     message TEXT
 );
+
 
 INSERT INTO roles (nom, description) VALUES
 ('admin', 'Administrateur avec tous les droits'),
